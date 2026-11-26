@@ -4,7 +4,13 @@ import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM, estimate_model_footprint, torch
+from model.model_minimind import (
+    MiniMindConfig,
+    MiniMindForCausalLM,
+    estimate_model_footprint,
+    recommend_training_hyperparams,
+    torch,
+)
 
 
 class TestMiniMindFootprint(unittest.TestCase):
@@ -84,6 +90,21 @@ class TestMiniMindFootprint(unittest.TestCase):
         est_low = estimate_model_footprint(cfg, batch_size=0, seq_len=-10)
         self.assertEqual(est_low["clamped_seq_len"], 1)
         self.assertEqual(est_low["batch_size"], 1)
+
+    def test_recommend_training_hyperparams_scales_with_vram(self):
+        cfg = MiniMindConfig(hidden_size=512, num_hidden_layers=8)
+        rec_low = recommend_training_hyperparams(cfg, vram_gb=6.0)
+        rec_high = recommend_training_hyperparams(cfg, vram_gb=24.0)
+
+        for key in ("batch_size", "gradient_accumulation_steps", "dtype", "learning_rate"):
+            self.assertIn(key, rec_low)
+            self.assertIn(key, rec_high)
+
+        self.assertEqual(rec_low["dtype"], "float16")
+        self.assertEqual(rec_high["dtype"], "bfloat16")
+        self.assertGreaterEqual(rec_high["batch_size"], rec_low["batch_size"])
+        self.assertLessEqual(rec_high["gradient_accumulation_steps"], rec_low["gradient_accumulation_steps"])
+        self.assertGreater(rec_high["learning_rate"], 0)
 
 
 if __name__ == "__main__":

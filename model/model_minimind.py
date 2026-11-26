@@ -387,3 +387,52 @@ def estimate_model_footprint(config: MiniMindConfig = None, batch_size: int = 1,
         "batch_size": batch_size,
         "use_moe": bool(cfg.use_moe),
     }
+
+
+def recommend_training_hyperparams(config: MiniMindConfig = None, vram_gb: float = 24.0, seq_len: int = 512) -> dict:
+    """Recommends optimal batch_size, gradient_accumulation_steps, dtype, and learning_rate for a given GPU VRAM budget."""
+    cfg = config or MiniMindConfig()
+    vram_gb = max(1.0, float(vram_gb))
+    seq_len = max(64, min(int(seq_len), int(cfg.max_position_embeddings)))
+    fp = estimate_model_footprint(cfg, batch_size=1, seq_len=seq_len, bytes_per_param=2)
+
+    # Mixed precision training state (weights + master fp32 + AdamW m/v + gradients) ~ 16 bytes/param
+    mb = 1024 * 1024
+    static_training_mb = (fp["total_params"] * 16) / mb
+    # Approximate activation memory per micro-batch sample (in MB)
+    h = int(cfg.hidden_size)
+    L = int(cfg.num_hidden_layers)
+    per_sample_act_mb = max(4.0, (L * seq_len * h * 16) / mb)
+
+    usable_vram_mb = vram_gb * 1024 * 0.82
+    avail_for_batch_mb = max(per_sample_act_mb, usable_vram_mb - static_training_mb)
+    raw_batch = max(1, int(avail_for_batch_mb // per_sample_act_mb))
+
+    # Snap batch_size to practical power-of-2 training micro-batch size [1..128]
+    batch_size = 1
+    for candidate in (1, 2, 4, 8, 16, 32, 64, 128):
+        if candidate <= raw_batch:
+            batch_size = candidate
+        else:
+            break
+
+    target_global_batch = 64
+    gradient_accumulation_steps = max(1, math.ceil(target_global_batch / batch_size))
+    dtype = "bfloat16" if vram_gb >= 12.0 else "float16"
+
+    # Scale learning rate mildly with model size and global batch size
+    base_lr = 5e-4 if fp["active_params"] <= 50_000_000 else (3e-4 if fp["active_params"] <= 200_000_000 else 1.5e-4)
+    effective_batch = batch_size * gradient_accumulation_steps
+    lr_scale = math.sqrt(effective_batch / 64.0)
+    learning_rate = round(base_lr * lr_scale, 6)
+
+    return {
+        "vram_gb": vram_gb,
+        "batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "effective_batch_size": effective_batch,
+        "dtype": dtype,
+        "learning_rate": learning_rate,
+        "static_training_mb": round(static_training_mb, 2),
+        "per_sample_activation_mb": round(per_sample_act_mb, 2),
+    }
