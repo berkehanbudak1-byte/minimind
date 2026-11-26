@@ -249,7 +249,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else (slice(None) if logits_to_keep == 0 else logits_to_keep)
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
@@ -275,7 +275,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]; logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
             if do_sample and top_k > 0:
-                logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
+                logits[logits < torch.topk(logits, min(top_k, logits.size(-1)))[0][..., -1, None]] = -float('inf')
             if do_sample and top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
