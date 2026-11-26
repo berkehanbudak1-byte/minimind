@@ -1,8 +1,43 @@
-import math, torch, torch.nn.functional as F
-from torch import nn
-from transformers.activations import ACT2FN
-from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+import math
+try:
+    import torch
+    import torch.nn.functional as F
+    from torch import nn
+except ImportError:
+    torch = None
+    F = None
+    class _NNStub:
+        Module = object
+        Parameter = lambda *a, **k: None
+        Linear = lambda *a, **k: None
+        Dropout = lambda *a, **k: None
+        ModuleList = list
+        Embedding = lambda *a, **k: None
+    nn = _NNStub()
+
+try:
+    from transformers.activations import ACT2FN
+    from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+    from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+except ImportError:
+    ACT2FN = {"silu": lambda x: x}
+    class PretrainedConfig:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    class PreTrainedModel:
+        def __init__(self, config=None):
+            self.config = config
+        def post_init(self):
+            pass
+    class GenerationMixin:
+        pass
+    class MoeCausalLMOutputWithPast:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+_inference_mode = torch.inference_mode if torch is not None else (lambda: (lambda fn: fn))
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Config
@@ -47,7 +82,7 @@ class MiniMindConfig(PretrainedConfig):
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -83,7 +118,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+def repeat_kv(x, n_rep: int):
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1: return x
     return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
@@ -258,7 +293,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
     
     # https://github.com/jingyaogong/minimind/discussions/611
-    @torch.inference_mode()
+    @_inference_mode()
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
         if do_sample and not 0 < temperature < math.inf: raise ValueError("Sampling temperature must be finite and positive")
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
@@ -291,3 +326,64 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         if streamer: streamer.end()
         if kwargs.get("return_kv"): return {'generated_ids': input_ids, 'past_kv': past_key_values}
         return input_ids
+
+
+def estimate_model_footprint(config: MiniMindConfig = None, batch_size: int = 1, seq_len: int = 2048, bytes_per_param: int = 2) -> dict:
+    """Estimates total & active model parameters, weights memory, KV-cache VRAM in MB, and clamped generation sequence length."""
+    cfg = config or MiniMindConfig()
+    batch_size = max(1, int(batch_size))
+    clamped_seq_len = max(1, min(int(seq_len), int(cfg.max_position_embeddings)))
+
+    h = int(cfg.hidden_size)
+    L = int(cfg.num_hidden_layers)
+    V = int(cfg.vocab_size)
+    n_heads = int(cfg.num_attention_heads)
+    n_kv_heads = int(cfg.num_key_value_heads if cfg.num_key_value_heads is not None else n_heads)
+    head_dim = int(cfg.head_dim)
+
+    embed_params = V * h
+    lm_head_params = 0 if cfg.tie_word_embeddings else (V * h)
+    final_norm_params = h
+
+    attn_params_per_layer = (
+        h * (n_heads * head_dim)
+        + h * (n_kv_heads * head_dim)
+        + h * (n_kv_heads * head_dim)
+        + (n_heads * head_dim) * h
+        + 2 * head_dim
+    )
+    block_norm_params_per_layer = 2 * h
+
+    if cfg.use_moe:
+        inter = int(cfg.moe_intermediate_size)
+        n_exp = int(cfg.num_experts)
+        k_exp = max(1, min(int(cfg.num_experts_per_tok), n_exp))
+        single_ffn = 3 * h * inter
+        mlp_total_per_layer = (h * n_exp) + (n_exp * single_ffn)
+        mlp_active_per_layer = (h * n_exp) + (k_exp * single_ffn)
+    else:
+        inter = int(cfg.intermediate_size)
+        mlp_total_per_layer = 3 * h * inter
+        mlp_active_per_layer = mlp_total_per_layer
+
+    total_params = embed_params + lm_head_params + final_norm_params + L * (
+        attn_params_per_layer + block_norm_params_per_layer + mlp_total_per_layer
+    )
+    active_params = embed_params + lm_head_params + final_norm_params + L * (
+        attn_params_per_layer + block_norm_params_per_layer + mlp_active_per_layer
+    )
+
+    kv_cache_bytes = 2 * L * batch_size * clamped_seq_len * n_kv_heads * head_dim * bytes_per_param
+    weights_bytes = total_params * bytes_per_param
+    mb = 1024 * 1024
+
+    return {
+        "total_params": total_params,
+        "active_params": active_params,
+        "weights_mb": round(weights_bytes / mb, 4),
+        "kv_cache_mb": round(kv_cache_bytes / mb, 4),
+        "total_vram_mb": round((weights_bytes + kv_cache_bytes) / mb, 4),
+        "clamped_seq_len": clamped_seq_len,
+        "batch_size": batch_size,
+        "use_moe": bool(cfg.use_moe),
+    }
