@@ -436,3 +436,76 @@ def recommend_training_hyperparams(config: MiniMindConfig = None, vram_gb: float
         "static_training_mb": round(static_training_mb, 2),
         "per_sample_activation_mb": round(per_sample_act_mb, 2),
     }
+
+
+def benchmark_context_scaling(
+    config: MiniMindConfig = None,
+    context_lengths=None,
+    vram_gb: float = 24.0,
+    bytes_per_param: int = 2,
+) -> dict:
+    """Models prefill/decode KV-cache memory scaling and max batch size across context lengths for a GPU VRAM budget."""
+    cfg = config or MiniMindConfig()
+    vram_gb = max(0.1, float(vram_gb))
+    bytes_per_param = max(1, int(bytes_per_param))
+    lengths = sorted({max(1, int(x)) for x in (context_lengths or (512, 1024, 2048, 4096, 8192, 16384, 32768))})
+
+    fp = estimate_model_footprint(cfg, batch_size=1, seq_len=1, bytes_per_param=bytes_per_param)
+    h = int(cfg.hidden_size)
+    L = int(cfg.num_hidden_layers)
+    n_heads = int(cfg.num_attention_heads)
+    n_kv_heads = int(cfg.num_key_value_heads if cfg.num_key_value_heads is not None else n_heads)
+    head_dim = int(cfg.head_dim)
+    eff_inter = (
+        int(cfg.moe_intermediate_size) * max(1, int(cfg.num_experts_per_tok))
+        if cfg.use_moe
+        else int(cfg.intermediate_size)
+    )
+    mb = 1024 * 1024
+
+    weights_mb = (fp["total_params"] * bytes_per_param) / mb
+    usable_vram_mb = vram_gb * 1024.0 * 0.90
+    avail_mb = max(0.0, usable_vram_mb - weights_mb)
+
+    results = []
+    for ctx in lengths:
+        kv_bytes = 2 * L * ctx * n_kv_heads * head_dim * bytes_per_param
+        kv_mb = kv_bytes / mb
+
+        attn_matrix_bytes = 0 if cfg.flash_attn else (n_heads * ctx * ctx * bytes_per_param)
+        prefill_act_bytes = ctx * (4 * h + 2 * eff_inter) * bytes_per_param + attn_matrix_bytes
+        prefill_act_mb = prefill_act_bytes / mb
+        prefill_peak_mb = kv_mb + prefill_act_mb
+
+        decode_scratch_mb = (n_heads * ctx * bytes_per_param + h * 4 * bytes_per_param) / mb
+        decode_step_mb = kv_mb + decode_scratch_mb
+
+        max_prefill_batch = int(avail_mb // prefill_peak_mb) if avail_mb >= prefill_peak_mb and prefill_peak_mb > 0 else 0
+        max_decode_batch = int(avail_mb // decode_step_mb) if avail_mb >= decode_step_mb and decode_step_mb > 0 else 0
+        max_batch = min(max_prefill_batch, max_decode_batch)
+
+        results.append({
+            "context_length": ctx,
+            "within_max_positions": ctx <= int(cfg.max_position_embeddings),
+            "kv_cache_mb_per_seq": round(kv_mb, 4),
+            "prefill_activation_mb_per_seq": round(prefill_act_mb, 4),
+            "prefill_total_mb_batch1": round(weights_mb + prefill_peak_mb, 4),
+            "decode_kv_mb_per_seq": round(kv_mb, 4),
+            "decode_total_mb_batch1": round(weights_mb + decode_step_mb, 4),
+            "max_prefill_batch_size": max_prefill_batch,
+            "max_decode_batch_size": max_decode_batch,
+            "max_batch_size": max_batch,
+            "fits": max_batch >= 1,
+        })
+
+    return {
+        "vram_gb": vram_gb,
+        "usable_vram_mb": round(usable_vram_mb, 2),
+        "weights_mb": round(weights_mb, 4),
+        "total_params": fp["total_params"],
+        "active_params": fp["active_params"],
+        "bytes_per_param": bytes_per_param,
+        "flash_attn": bool(cfg.flash_attn),
+        "max_supported_context": max((r["context_length"] for r in results if r["fits"]), default=0),
+        "results": results,
+    }
