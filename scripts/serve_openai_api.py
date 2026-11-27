@@ -13,22 +13,25 @@ from typing import Any, Dict, List, Optional
 __package__ = "scripts"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from scripts.api_security import (
+    DPAPIError,
     MAX_MESSAGES,
     MAX_MODEL_NAME_LEN,
     MAX_TOKENS_MAX,
     MAX_TOKENS_MIN,
     MAX_TOOLS,
+    SlidingWindowAuthRateLimiter,
     TEMPERATURE_MAX,
     TEMPERATURE_MIN,
     TOP_P_MAX,
     TOP_P_MIN,
     extract_open_thinking,
     redact_sensitive_text,
+    resolve_dpapi_secret,
     safe_error_message,
     validate_and_sanitize_messages,
     validate_generation_params,
@@ -69,18 +72,54 @@ logger = logging.getLogger("minimind.api")
 
 app = FastAPI()
 
+API_SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; script-src 'none'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    for k, v in API_SECURITY_HEADERS.items():
+        response.headers.setdefault(k, v)
+    return response
+
+
 # Runtime globals populated by init_model() or test fixtures
 device = "cpu"
 model = None
 tokenizer = None
 API_KEY: Optional[str] = os.environ.get("MINIMIND_API_KEY", "").strip() or None
+auth_rate_limiter = SlidingWindowAuthRateLimiter(max_failures=5, window_seconds=60.0, max_tracked_ips=4096)
 
 
-def get_configured_api_key() -> Optional[str]:
+def _raw_configured_api_key() -> Optional[str]:
     if API_KEY:
-        return API_KEY
+        return API_KEY.strip() or None
     env_key = os.environ.get("MINIMIND_API_KEY", "").strip()
     return env_key or None
+
+
+def get_configured_api_key(runner=None) -> Optional[str]:
+    raw = _raw_configured_api_key()
+    if not raw:
+        return None
+    return resolve_dpapi_secret(raw, runner=runner)
+
+
+def _extract_client_ip(http_request: Optional[Request]) -> str:
+    if http_request is None:
+        return "unknown"
+    if os.environ.get("MINIMIND_TRUST_PROXY") == "1":
+        xff = (http_request.headers.get("x-forwarded-for") or "").strip()
+        if xff:
+            return xff.split(",")[-1].strip() or "unknown"
+    client = getattr(http_request, "client", None)
+    host = getattr(client, "host", None) if client is not None else None
+    return str(host).strip() if host else "unknown"
 
 
 def init_model(args):
@@ -266,11 +305,31 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
 @app.post("/v1/chat/completions")
 def chat_completions(
     request: ChatRequest,
+    http_request: Request,
     authorization: Optional[str] = Header(default=None),
 ):
-    expected_key = get_configured_api_key()
-    if not verify_bearer_token(authorization, expected_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    raw_key = _raw_configured_api_key()
+    if raw_key:
+        client_ip = _extract_client_ip(http_request)
+        allowed, retry_after = auth_rate_limiter.check_allowed(client_ip)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed authentication attempts",
+                headers={"Retry-After": str(retry_after)},
+            )
+        try:
+            expected_key = get_configured_api_key()
+        except (DPAPIError, ValueError):
+            raise HTTPException(status_code=503, detail="API key configuration error") from None
+        if not verify_bearer_token(authorization, expected_key):
+            auth_rate_limiter.record_failure(client_ip)
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        auth_rate_limiter.record_success(client_ip)
 
     try:
         sanitized_messages = validate_and_sanitize_messages(request.messages)
