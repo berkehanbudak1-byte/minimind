@@ -1,78 +1,136 @@
 import argparse
 import json
-import re
+import logging
 import os
+import re
 import sys
+import time
+import warnings
+from queue import Queue
+from threading import Thread
+from typing import Any, Dict, List, Optional
 
 __package__ = "scripts"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-import time
-import torch
-import warnings
-import uvicorn
 
-from threading import Thread
-from queue import Queue
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
+
+from scripts.api_security import (
+    MAX_MESSAGES,
+    MAX_MODEL_NAME_LEN,
+    MAX_TOKENS_MAX,
+    MAX_TOKENS_MIN,
+    MAX_TOOLS,
+    TEMPERATURE_MAX,
+    TEMPERATURE_MIN,
+    TOP_P_MAX,
+    TOP_P_MIN,
+    extract_open_thinking,
+    redact_sensitive_text,
+    safe_error_message,
+    validate_and_sanitize_messages,
+    validate_generation_params,
+    validate_tools,
+    verify_bearer_token,
+)
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    import uvicorn
+except ImportError:
+    uvicorn = None
+
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+except ImportError:
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+
+    class TextStreamer:  # type: ignore[no-redef]
+        def __init__(self, tokenizer=None, skip_prompt=True, skip_special_tokens=True):
+            self.tokenizer = tokenizer
+
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
-from model.model_lora import apply_lora, load_lora
+
+try:
+    from model.model_lora import apply_lora, load_lora
+except ImportError:
+    apply_lora = None
+    load_lora = None
 
 warnings.filterwarnings('ignore')
+logger = logging.getLogger("minimind.api")
 
 app = FastAPI()
 
+# Runtime globals populated by init_model() or test fixtures
+device = "cpu"
+model = None
+tokenizer = None
+API_KEY: Optional[str] = os.environ.get("MINIMIND_API_KEY", "").strip() or None
+
+
+def get_configured_api_key() -> Optional[str]:
+    if API_KEY:
+        return API_KEY
+    env_key = os.environ.get("MINIMIND_API_KEY", "").strip()
+    return env_key or None
+
 
 def init_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    if torch is None or AutoTokenizer is None:
+        raise RuntimeError("torch and transformers are required to load MiniMind weights")
+    tok = AutoTokenizer.from_pretrained(args.load_from)
     if os.path.basename(os.path.normpath(args.load_from)) == 'model':
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'../{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
-        model = MiniMindForCausalLM(MiniMindConfig(
+        mdl = MiniMindForCausalLM(MiniMindConfig(
             hidden_size=args.hidden_size,
             num_hidden_layers=args.num_hidden_layers,
             max_seq_len=args.max_seq_len,
             use_moe=bool(args.use_moe),
             inference_rope_scaling=args.inference_rope_scaling
         ))
-        model.load_state_dict(torch.load(ckp, map_location=device), strict=True)
+        mdl.load_state_dict(torch.load(ckp, map_location=device, weights_only=True), strict=True)
         if args.lora_weight != 'None':
-            apply_lora(model, rank=args.lora_rank)
-            load_lora(model, f'../{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
+            apply_lora(mdl, rank=args.lora_rank)
+            load_lora(mdl, f'../{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
     else:
-        model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
-    print(f'MiniMind模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)')
-    return model.half().eval().to(device), tokenizer
+        mdl = AutoModelForCausalLM.from_pretrained(
+            args.load_from,
+            trust_remote_code=bool(getattr(args, "trust_remote_code", False)),
+        )
+    print(f'MiniMind模型参数量: {sum(p.numel() for p in mdl.parameters()) / 1e6:.2f} M(illion)')
+    return mdl.half().eval().to(device), tok
 
 
 class ChatRequest(BaseModel):
-    model: str
-    messages: list
-    temperature: float = Field(default=0.7, ge=0.0, allow_inf_nan=False)
-    top_p: float = 0.92
-    max_tokens: int = 8192
+    model: str = Field(..., min_length=1, max_length=MAX_MODEL_NAME_LEN)
+    messages: List[Dict[str, Any]] = Field(..., min_length=1, max_length=MAX_MESSAGES)
+    temperature: float = Field(default=0.7, ge=TEMPERATURE_MIN, le=TEMPERATURE_MAX, allow_inf_nan=False)
+    top_p: float = Field(default=0.92, ge=TOP_P_MIN, le=TOP_P_MAX, allow_inf_nan=False)
+    max_tokens: int = Field(default=2048, ge=MAX_TOKENS_MIN, le=MAX_TOKENS_MAX)
     stream: bool = True
-    tools: list = Field(default_factory=list)
+    tools: List[Dict[str, Any]] = Field(default_factory=list, max_length=MAX_TOOLS)
     open_thinking: bool = False
-    chat_template_kwargs: dict = None
-    
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
+
     def get_open_thinking(self) -> bool:
-        """兼容多种方式开启 thinking"""
-        if self.open_thinking:
-            return True
-        if self.chat_template_kwargs:
-            return self.chat_template_kwargs.get('open_thinking', False) or \
-                   self.chat_template_kwargs.get('enable_thinking', False)
-        return False
+        """兼容多种方式开启 thinking (restricted to allowlisted keys)"""
+        return extract_open_thinking(self.open_thinking, self.chat_template_kwargs)
 
 
 class CustomStreamer(TextStreamer):
-    def __init__(self, tokenizer, queue):
-        super().__init__(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    def __init__(self, tok, queue):
+        super().__init__(tok, skip_prompt=True, skip_special_tokens=True)
         self.queue = queue
-        self.tokenizer = tokenizer
+        self.tokenizer = tok
 
     def on_finalized_text(self, text: str, stream_end: bool = False):
         self.queue.put(text)
@@ -104,8 +162,13 @@ def parse_response(text):
 
 def generate_stream_response(messages, temperature, top_p, max_tokens, tools=None, open_thinking=False):
     try:
+        if model is None or tokenizer is None:
+            raise RuntimeError("Model is not initialized")
+
         new_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools or None, open_thinking=open_thinking)
-        inputs = tokenizer(new_prompt, return_tensors="pt", truncation=True).to(device)
+        inputs = tokenizer(new_prompt, return_tensors="pt", truncation=True)
+        if hasattr(inputs, "to"):
+            inputs = inputs.to(device)
 
         queue = Queue()
         streamer = CustomStreamer(tokenizer, queue)
@@ -113,21 +176,22 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
         def _generate():
             try:
                 model.generate(
-                    inputs.input_ids,
+                    inputs["input_ids"],
                     max_new_tokens=max_tokens,
                     do_sample=temperature > 0,
                     temperature=temperature,
                     top_p=top_p,
-                    attention_mask=inputs.attention_mask,
+                    attention_mask=inputs["attention_mask"],
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     streamer=streamer
                 )
             except Exception as e:
-                queue.put({"error": str(e)})
+                logger.warning("MiniMind stream generation error: %s", redact_sensitive_text(str(e)))
+                queue.put({"error": safe_error_message(e, "Stream generation failed")})
                 queue.put(None)
 
-        Thread(target=_generate).start()
+        Thread(target=_generate, daemon=True).start()
 
         pending = ""
         in_tool_call = False
@@ -195,45 +259,79 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
         yield json.dumps({"choices": [{"delta": {}, "finish_reason": "tool_calls" if tool_count else "stop"}]}, ensure_ascii=False)
 
     except Exception as e:
-        yield json.dumps({"error": str(e)})
+        logger.warning("MiniMind stream error: %s", redact_sensitive_text(str(e)))
+        yield json.dumps({"error": safe_error_message(e, "Stream generation failed")})
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(request: ChatRequest):
+def chat_completions(
+    request: ChatRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    expected_key = get_configured_api_key()
+    if not verify_bearer_token(authorization, expected_key):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        sanitized_messages = validate_and_sanitize_messages(request.messages)
+        temperature, top_p, max_tokens = validate_generation_params(
+            temperature=request.temperature,
+            top_p=request.top_p,
+            max_tokens=request.max_tokens,
+        )
+        sanitized_tools = validate_tools(request.tools)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if model is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model service is not initialized")
+
     try:
         if request.stream:
             return StreamingResponse(
                 (f"data: {chunk}\n\n" for chunk in generate_stream_response(
-                    messages=request.messages,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    max_tokens=request.max_tokens,
-                    tools=request.tools,
+                    messages=sanitized_messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    tools=sanitized_tools,
                     open_thinking=request.get_open_thinking()
                 )),
-                media_type="text/event-stream"
+                media_type="text/event-stream",
+                headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
             )
         else:
             new_prompt = tokenizer.apply_chat_template(
-                request.messages,
+                sanitized_messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                tools=request.tools or None,
+                tools=sanitized_tools or None,
                 open_thinking=request.get_open_thinking()
             )
-            inputs = tokenizer(new_prompt, return_tensors="pt", truncation=True).to(device)
-            with torch.no_grad():
-                generated_ids = model.generate(
+            inputs = tokenizer(new_prompt, return_tensors="pt", truncation=True)
+            if hasattr(inputs, "to"):
+                inputs = inputs.to(device)
+
+            def _run_generate():
+                return model.generate(
                     inputs["input_ids"],
-                    max_new_tokens=request.max_tokens,
-                    do_sample=request.temperature > 0,
+                    max_new_tokens=max_tokens,
+                    do_sample=temperature > 0,
                     attention_mask=inputs["attention_mask"],
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
-                    top_p=request.top_p,
-                    temperature=request.temperature
+                    top_p=top_p,
+                    temperature=temperature
                 )
-                answer = tokenizer.decode(generated_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+            if torch is not None:
+                with torch.no_grad():
+                    generated_ids = _run_generate()
+            else:
+                generated_ids = _run_generate()
+
+            prompt_len = inputs["input_ids"].shape[1] if hasattr(inputs["input_ids"], "shape") else len(inputs["input_ids"][0])
+            answer = tokenizer.decode(generated_ids[0][prompt_len:], skip_special_tokens=True)
             content, reasoning_content, tool_calls = parse_response(answer)
             message = {"role": "assistant", "content": content}
             if reasoning_content:
@@ -253,8 +351,11 @@ def chat_completions(request: ChatRequest):
                     }
                 ]
             }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.warning("MiniMind completion error: %s", redact_sensitive_text(str(e)))
+        raise HTTPException(status_code=500, detail=safe_error_message(e, "Internal generation error"))
 
 
 if __name__ == "__main__":
@@ -269,8 +370,16 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=8192, type=int, help="最大序列长度")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    parser.add_argument('--device', default='cuda' if (torch is not None and torch.cuda.is_available()) else 'cpu', type=str, help="运行设备")
+    parser.add_argument('--host', default='127.0.0.1', type=str, help="服务监听地址（默认 127.0.0.1，如需外部访问请显式传 0.0.0.0 并配置 MINIMIND_API_KEY）")
+    parser.add_argument('--port', default=8998, type=int, help="服务监听端口")
+    parser.add_argument('--api_key', default='', type=str, help="可选 Bearer API Key（也可通过 MINIMIND_API_KEY 环境变量设置）")
+    parser.add_argument('--trust_remote_code', default=False, action='store_true', help="仅在信任 HuggingFace 模型仓库时启用远程代码执行")
     args = parser.parse_args()
     device = args.device
+    if args.api_key.strip():
+        API_KEY = args.api_key.strip()
     model, tokenizer = init_model(args)
-    uvicorn.run(app, host="0.0.0.0", port=8998)
+    if uvicorn is None:
+        raise RuntimeError("uvicorn is required to start the server")
+    uvicorn.run(app, host=args.host, port=args.port)

@@ -12,6 +12,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStream
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from trainer.trainer_utils import safe_math_eval
+from scripts.api_security import (
+    MAX_MESSAGE_CHARS,
+    escape_html_text,
+    strip_template_control_tokens,
+)
 
 st.set_page_config(page_title="MiniMind", initial_sidebar_state="collapsed")
 
@@ -127,40 +132,48 @@ TOOL_SHORT_NAMES = {
 
 def execute_tool(tool_name, args):
     import datetime
+    if not isinstance(args, dict):
+        return {"error": "Invalid tool arguments"}
     try:
         if tool_name == 'calculate_math':
-            return {"result": safe_math_eval(args.get('expression', '0'))}
+            expr = str(args.get('expression', '0'))[:256]
+            return {"result": safe_math_eval(expr)}
         elif tool_name == 'get_current_time':
-            tz = args.get('timezone', 'Asia/Shanghai')
             return {"result": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         elif tool_name == 'random_number':
-            return {"result": random.randint(args.get('min', 0), args.get('max', 100))}
+            lo = int(args.get('min', 0))
+            hi = int(args.get('max', 100))
+            if lo > hi:
+                lo, hi = hi, lo
+            lo = max(-10**9, min(10**9, lo))
+            hi = max(-10**9, min(10**9, hi))
+            return {"result": random.randint(lo, hi)}
         elif tool_name == 'text_length':
-            return {"result": len(args.get('text', ''))}
+            return {"result": len(str(args.get('text', '')))}
         elif tool_name == 'unit_converter':
-            return {"result": f"{args.get('value', 0)} {args.get('from_unit', '')} = ? {args.get('to_unit', '')}"}
+            return {"result": f"{args.get('value', 0)} {str(args.get('from_unit', ''))[:32]} = ? {str(args.get('to_unit', ''))[:32]}"}
         elif tool_name == 'get_current_weather':
-            return {"result": f"{args.get('city', 'Unknown')}: 晴, 7~10°C"}
+            return {"result": f"{str(args.get('city', 'Unknown'))[:64]}: 晴, 7~10°C"}
         elif tool_name == 'get_exchange_rate':
-            return {"result": f"1 {args.get('from_currency', 'USD')} = 7.2 {args.get('to_currency', 'CNY')}"}
+            return {"result": f"1 {str(args.get('from_currency', 'USD'))[:16]} = 7.2 {str(args.get('to_currency', 'CNY'))[:16]}"}
         elif tool_name == 'translate_text':
-            return {"result": f"[翻译结果]: hello world"}
+            return {"result": "[翻译结果]: hello world"}
         return {"result": "Unknown tool"}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return {"error": "Tool execution failed"}
 
 
 def process_assistant_content(content, is_streaming=False):
-    # 处理tool_call标签，格式化显示
+    # 处理tool_call标签，格式化显示 (HTML-escaped to prevent XSS)
     if '<tool_call>' in content:
         def format_tool_call(match):
             try:
                 tc = json.loads(match.group(1))
-                name = tc.get('name', 'unknown')
-                args = tc.get('arguments', {})
-                return f'<div style="background: rgba(80, 110, 150, 0.20); border: 1px solid rgba(140, 170, 210, 0.30); padding: 10px 12px; border-radius: 12px; margin: 6px 0;"><div style="font-size:12px;opacity:.75;display:block;margin:0 0 6px 0;line-height:1;">ToolCalling</div><div><b>{name}</b>: {json.dumps(args, ensure_ascii=False)}</div></div>'
-            except:
-                return match.group(0)
+                name = escape_html_text(tc.get('name', 'unknown'))
+                args = escape_html_text(json.dumps(tc.get('arguments', {}), ensure_ascii=False))
+                return f'<div style="background: rgba(80, 110, 150, 0.20); border: 1px solid rgba(140, 170, 210, 0.30); padding: 10px 12px; border-radius: 12px; margin: 6px 0;"><div style="font-size:12px;opacity:.75;display:block;margin:0 0 6px 0;line-height:1;">ToolCalling</div><div><b>{name}</b>: {args}</div></div>'
+            except Exception:
+                return escape_html_text(match.group(0))
         content = re.sub(r'<tool_call>(.*?)</tool_call>', format_tool_call, content, flags=re.DOTALL)
     
     # 流式生成且开启思考时，一开始就放到折叠里
@@ -168,31 +181,32 @@ def process_assistant_content(content, is_streaming=False):
         m = re.search(r'(\n\n(?:我是|您好|你好)[^\n]*)', content)
         if m and m.start(1) > 5:
             i = m.start(1)
-            think_part = content[:i]
+            think_part = escape_html_text(content[:i].strip())
             answer_part = content[i:]
-            return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">已思考</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{think_part.strip()}</div></details>{answer_part}'
+            return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">已思考</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{think_part}</div></details>{answer_part}'
         elif len(content) > 5:
-            return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">思考中...</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto; display: flex; flex-direction: column-reverse;"><div style="margin-bottom: auto;">{content.strip().replace(chr(10), "<br>")}</div></div></details>'
+            safe_stream = escape_html_text(content.strip()).replace(chr(10), "<br>")
+            return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">思考中...</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto; display: flex; flex-direction: column-reverse;"><div style="margin-bottom: auto;">{safe_stream}</div></div></details>'
 
     if '<think>' in content and '</think>' in content:
         def format_think(match):
             think_content = match.group(2)
             if think_content.replace('\n', '').strip():  # 不是全换行
-                return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">已思考</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{think_content.strip()}</div></details>'
+                return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">已思考</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{escape_html_text(think_content.strip())}</div></details>'
             return ''
         content = re.sub(r'(<think>)(.*?)(</think>)', format_think, content, flags=re.DOTALL)
 
     if '<think>' in content and '</think>' not in content:
         def format_think_in_progress(match):
-            tc = match.group(1)
-            return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">思考中...</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto; display: flex; flex-direction: column-reverse;"><div style="margin-bottom: auto;">{tc.strip().replace(chr(10), "<br>")}</div></div></details>'
+            tc = escape_html_text(match.group(1).strip()).replace(chr(10), "<br>")
+            return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">思考中...</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto; display: flex; flex-direction: column-reverse;"><div style="margin-bottom: auto;">{tc}</div></div></details>'
         content = re.sub(r'<think>(.*?)$', format_think_in_progress, content, flags=re.DOTALL)
 
     if '<think>' not in content and '</think>' in content:
         def format_think_no_start(match):
             think_content = match.group(1)
             if think_content.replace('\n', '').strip():
-                return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">已思考</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{think_content.strip()}</div></details>'
+                return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">已思考</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{escape_html_text(think_content.strip())}</div></details>'
             return ''
         content = re.sub(r'(.*?)</think>', format_think_no_start, content, flags=re.DOTALL)
 
@@ -225,7 +239,7 @@ def init_chat_messages():
                 st.markdown(process_assistant_content(message["content"]), unsafe_allow_html=True)
             else:
                 st.markdown(
-                    f'<div style="display: flex; justify-content: flex-end;"><div style="display: inline-block; margin: 10px 0; padding: 8px 12px 8px 12px; background-color: #3d4450; border-radius: 22px; color: white;">{message["content"]}</div></div>',
+                    f'<div style="display: flex; justify-content: flex-end;"><div style="display: inline-block; margin: 10px 0; padding: 8px 12px 8px 12px; background-color: #3d4450; border-radius: 22px; color: white;">{escape_html_text(message["content"])}</div></div>',
                     unsafe_allow_html=True)
 
     else:
@@ -327,7 +341,7 @@ def main():
             st.markdown(process_assistant_content(message["content"]), unsafe_allow_html=True)
         else:
             st.markdown(
-                f'<div style="display: flex; justify-content: flex-end;"><div style="display: inline-block; margin: 10px 0; padding: 8px 12px 8px 12px; background-color: #3d4450; border-radius: 22px; color: white;">{message["content"]}</div></div>',
+                f'<div style="display: flex; justify-content: flex-end;"><div style="display: inline-block; margin: 10px 0; padding: 8px 12px 8px 12px; background-color: #3d4450; border-radius: 22px; color: white;">{escape_html_text(message["content"])}</div></div>',
                 unsafe_allow_html=True)
 
     prompt = st.chat_input(key="input", placeholder=get_text('send'))
@@ -340,11 +354,12 @@ def main():
         delattr(st.session_state, 'regenerate_index')
 
     if prompt:
+        clean_prompt = strip_template_control_tokens(prompt)[:MAX_MESSAGE_CHARS]
         st.markdown(
-            f'<div style="display: flex; justify-content: flex-end;"><div style="display: inline-block; margin: 10px 0; padding: 8px 12px 8px 12px; background-color: #3d4450; border-radius: 22px; color: white;">{prompt}</div></div>',
+            f'<div style="display: flex; justify-content: flex-end;"><div style="display: inline-block; margin: 10px 0; padding: 8px 12px 8px 12px; background-color: #3d4450; border-radius: 22px; color: white;">{escape_html_text(clean_prompt)}</div></div>',
             unsafe_allow_html=True)
-        messages.append({"role": "user", "content": prompt})
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "user", "content": clean_prompt})
+        st.session_state.chat_messages.append({"role": "user", "content": clean_prompt})
 
         placeholder = st.empty()
 
@@ -396,8 +411,10 @@ def main():
                     tc = json.loads(tc_str.strip())
                     result = execute_tool(tc.get('name', ''), tc.get('arguments', {}))
                     st.session_state.chat_messages.append({"role": "tool", "content": json.dumps(result, ensure_ascii=False)})
-                    tool_results.append(f'<div style="background: rgba(90, 130, 110, 0.20); border: 1px solid rgba(150, 200, 170, 0.30); padding: 10px 12px; border-radius: 12px; margin: 6px 0;"><div style="font-size:12px;opacity:.75;display:block;margin:0 0 6px 0;line-height:1;">ToolCalled</div><div><b>{tc.get("name", "")}</b>: {json.dumps(result, ensure_ascii=False)}</div></div>')
-                except:
+                    safe_tool_name = escape_html_text(tc.get("name", ""))
+                    safe_tool_result = escape_html_text(json.dumps(result, ensure_ascii=False))
+                    tool_results.append(f'<div style="background: rgba(90, 130, 110, 0.20); border: 1px solid rgba(150, 200, 170, 0.30); padding: 10px 12px; border-radius: 12px; margin: 6px 0;"><div style="font-size:12px;opacity:.75;display:block;margin:0 0 6px 0;line-height:1;">ToolCalled</div><div><b>{safe_tool_name}</b>: {safe_tool_result}</div></div>')
+                except Exception:
                     pass
             full_answer += "\n" + "\n".join(tool_results) + "\n"
             placeholder.markdown(process_assistant_content(full_answer, is_streaming=True), unsafe_allow_html=True)
