@@ -1,8 +1,73 @@
+import asyncio
+import json
 import os
 import sys
 import unittest
+from typing import Any, Dict, List, Optional
 
-from fastapi.testclient import TestClient
+try:
+    from fastapi.testclient import TestClient
+except (ImportError, RuntimeError):
+    class _StdlibAsgiResponse:
+        def __init__(self, status_code: int, body: bytes):
+            self.status_code = status_code
+            self._body = body
+            self.text = body.decode("utf-8", errors="replace")
+
+        def json(self):
+            return json.loads(self.text)
+
+    class TestClient:  # type: ignore[no-redef]
+        """Minimal stdlib ASGI client fallback when httpx/httpx2 is unavailable."""
+
+        def __init__(self, app):
+            self.app = app
+
+        def post(self, path: str, *, json: Any = None, headers: Optional[Dict[str, str]] = None) -> _StdlibAsgiResponse:
+            import json as _json
+
+            body_bytes = _json.dumps(json).encode("utf-8") if json is not None else b""
+            raw_headers = [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body_bytes)).encode("ascii")),
+            ]
+            for k, v in (headers or {}).items():
+                raw_headers.append((k.lower().encode("latin-1"), v.encode("latin-1")))
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode("ascii"),
+                "query_string": b"",
+                "headers": raw_headers,
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+            }
+
+            sent = False
+            status_code = 500
+            chunks: List[bytes] = []
+
+            async def receive():
+                nonlocal sent
+                if not sent:
+                    sent = True
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                nonlocal status_code
+                if message["type"] == "http.response.start":
+                    status_code = message["status"]
+                elif message["type"] == "http.response.body":
+                    chunks.append(message.get("body", b""))
+
+            asyncio.run(self.app(scope, receive, send))
+            return _StdlibAsgiResponse(status_code, b"".join(chunks))
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 

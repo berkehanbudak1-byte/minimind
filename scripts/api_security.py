@@ -183,11 +183,46 @@ def extract_open_thinking(open_thinking: bool, chat_template_kwargs: Optional[Di
     return False
 
 
-def verify_bearer_token(authorization_header: Optional[str], expected_api_key: Optional[str]) -> bool:
-    """Constant-time Bearer token verification. Open when expected_api_key is unset."""
+def is_loopback_host(host: Optional[str]) -> bool:
+    """Return True only for explicit loopback bind addresses (127.0.0.1, localhost, ::1)."""
+    normalized = str(host or "").strip().lower().strip("[]")
+    return normalized in _LOOPBACK_HOSTS
+
+
+def validate_server_bind_security(
+    host: Optional[str],
+    api_key: Optional[str],
+    *,
+    allow_unauthenticated: bool = False,
+) -> bool:
+    """Refuse fail-open binding on non-loopback hosts unless an API key or explicit opt-in is set.
+
+    Returns whether bearer authentication must be enforced (fail-closed) for incoming requests.
+    """
+    key = (api_key or "").strip()
+    loopback = is_loopback_host(host)
+    if not loopback and not key and not allow_unauthenticated:
+        raise ValueError(
+            f"Refusing to bind to non-loopback host '{host}' without MINIMIND_API_KEY or --api_key. "
+            "Configure an API key or pass --allow-unauthenticated to opt in explicitly."
+        )
+    return bool(key) or (not loopback and not allow_unauthenticated)
+
+
+def verify_bearer_token(
+    authorization_header: Optional[str],
+    expected_api_key: Optional[str],
+    *,
+    require_auth: bool = False,
+) -> bool:
+    """Constant-time Bearer token verification.
+
+    Fails closed when ``require_auth=True`` and ``expected_api_key`` is unset.
+    When ``require_auth=False``, unset ``expected_api_key`` permits local loopback access.
+    """
     expected = (expected_api_key or "").strip()
     if not expected:
-        return True
+        return not require_auth
     header = (authorization_header or "").strip()
     if not header.lower().startswith("bearer "):
         return False
