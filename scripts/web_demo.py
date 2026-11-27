@@ -163,65 +163,129 @@ def execute_tool(tool_name, args):
         return {"error": "Tool execution failed"}
 
 
+def _render_plain_text(text):
+    return escape_html_text(text).replace("\n", "<br>")
+
+
+def _render_think_done(think_content):
+    if think_content.replace('\n', '').strip():  # 不是全换行
+        safe_think = escape_html_text(think_content.strip()).replace("\n", "<br>")
+        return (
+            '<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;">'
+            '<summary style="cursor: pointer; color: #888;">已思考</summary>'
+            f'<div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{safe_think}</div>'
+            '</details>'
+        )
+    return ''
+
+
+def _render_think_in_progress(think_content):
+    safe_tc = escape_html_text(think_content.strip()).replace("\n", "<br>")
+    return (
+        '<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;">'
+        '<summary style="cursor: pointer; color: #888;">思考中...</summary>'
+        '<div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto; '
+        f'display: flex; flex-direction: column-reverse;"><div style="margin-bottom: auto;">{safe_tc}</div></div>'
+        '</details>'
+    )
+
+
+def _render_plain_and_tool_segments(text):
+    """Render plain text and structured tool tags while HTML-escaping all untrusted content."""
+    if not text:
+        return ''
+    parts = []
+    pos = 0
+    tag_pattern = re.compile(r'<(tool_call|tool_result)>(.*?)</\1>', flags=re.DOTALL)
+    for match in tag_pattern.finditer(text):
+        if match.start() > pos:
+            parts.append(_render_plain_text(text[pos:match.start()]))
+        tag_type = match.group(1)
+        raw_body = match.group(2)
+        try:
+            payload = json.loads(raw_body.strip())
+            if not isinstance(payload, dict):
+                raise ValueError("Expected JSON object")
+            if tag_type == 'tool_call':
+                name = escape_html_text(payload.get('name', 'unknown'))
+                args = escape_html_text(json.dumps(payload.get('arguments', {}), ensure_ascii=False))
+                parts.append(
+                    '<div style="background: rgba(80, 110, 150, 0.20); border: 1px solid rgba(140, 170, 210, 0.30); '
+                    'padding: 10px 12px; border-radius: 12px; margin: 6px 0;">'
+                    '<div style="font-size:12px;opacity:.75;display:block;margin:0 0 6px 0;line-height:1;">ToolCalling</div>'
+                    f'<div><b>{name}</b>: {args}</div></div>'
+                )
+            else:
+                safe_tool_name = escape_html_text(payload.get('name', ''))
+                safe_tool_result = escape_html_text(json.dumps(payload.get('result', {}), ensure_ascii=False))
+                parts.append(
+                    '<div style="background: rgba(90, 130, 110, 0.20); border: 1px solid rgba(150, 200, 170, 0.30); '
+                    'padding: 10px 12px; border-radius: 12px; margin: 6px 0;">'
+                    '<div style="font-size:12px;opacity:.75;display:block;margin:0 0 6px 0;line-height:1;">ToolCalled</div>'
+                    f'<div><b>{safe_tool_name}</b>: {safe_tool_result}</div></div>'
+                )
+        except Exception:
+            parts.append(_render_plain_text(match.group(0)))
+        pos = match.end()
+    if pos < len(text):
+        parts.append(_render_plain_text(text[pos:]))
+    return ''.join(parts)
+
+
 def process_assistant_content(content, is_streaming=False):
-    # 处理tool_call标签，格式化显示 (HTML-escaped to prevent XSS)
-    if '<tool_call>' in content:
-        def format_tool_call(match):
-            try:
-                tc = json.loads(match.group(1))
-                name = escape_html_text(tc.get('name', 'unknown'))
-                args = escape_html_text(json.dumps(tc.get('arguments', {}), ensure_ascii=False))
-                return f'<div style="background: rgba(80, 110, 150, 0.20); border: 1px solid rgba(140, 170, 210, 0.30); padding: 10px 12px; border-radius: 12px; margin: 6px 0;"><div style="font-size:12px;opacity:.75;display:block;margin:0 0 6px 0;line-height:1;">ToolCalling</div><div><b>{name}</b>: {args}</div></div>'
-            except Exception:
-                return escape_html_text(match.group(0))
-        content = re.sub(r'<tool_call>(.*?)</tool_call>', format_tool_call, content, flags=re.DOTALL)
-    
+    content = str(content or "")
+
     # 流式生成且开启思考时，一开始就放到折叠里
     if is_streaming and st.session_state.get('enable_thinking', False) and '</think>' not in content and '<think>' not in content:
         m = re.search(r'(\n\n(?:我是|您好|你好)[^\n]*)', content)
         if m and m.start(1) > 5:
             i = m.start(1)
-            think_part = escape_html_text(content[:i].strip())
-            answer_part = content[i:]
-            return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">已思考</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{think_part}</div></details>{answer_part}'
+            think_html = _render_think_done(content[:i])
+            answer_html = _render_plain_and_tool_segments(content[i:])
+            return f'{think_html}{answer_html}'
         elif len(content) > 5:
-            safe_stream = escape_html_text(content.strip()).replace(chr(10), "<br>")
-            return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">思考中...</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto; display: flex; flex-direction: column-reverse;"><div style="margin-bottom: auto;">{safe_stream}</div></div></details>'
+            return _render_think_in_progress(content)
 
-    if '<think>' in content and '</think>' in content:
-        def format_think(match):
-            think_content = match.group(2)
-            if think_content.replace('\n', '').strip():  # 不是全换行
-                return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">已思考</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{escape_html_text(think_content.strip())}</div></details>'
-            return ''
-        content = re.sub(r'(<think>)(.*?)(</think>)', format_think, content, flags=re.DOTALL)
+    parts = []
+    remaining = content
 
-    if '<think>' in content and '</think>' not in content:
-        def format_think_in_progress(match):
-            tc = escape_html_text(match.group(1).strip()).replace(chr(10), "<br>")
-            return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">思考中...</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto; display: flex; flex-direction: column-reverse;"><div style="margin-bottom: auto;">{tc}</div></div></details>'
-        content = re.sub(r'<think>(.*?)$', format_think_in_progress, content, flags=re.DOTALL)
+    # 处理省略起始 <think> 标签、直接以 </think> 结束的思考段
+    first_close = remaining.find('</think>')
+    first_open = remaining.find('<think>')
+    if first_close != -1 and (first_open == -1 or first_close < first_open):
+        parts.append(_render_think_done(remaining[:first_close]))
+        remaining = remaining[first_close + len('</think>'):]
 
-    if '<think>' not in content and '</think>' in content:
-        def format_think_no_start(match):
-            think_content = match.group(1)
-            if think_content.replace('\n', '').strip():
-                return f'<details open style="border-left: 2px solid #666; padding-left: 12px; margin: 8px 0;"><summary style="cursor: pointer; color: #888;">已思考</summary><div style="color: #aaa; font-size: 0.95em; margin-top: 8px; max-height: 100px; overflow-y: auto;">{escape_html_text(think_content.strip())}</div></details>'
-            return ''
-        content = re.sub(r'(.*?)</think>', format_think_no_start, content, flags=re.DOTALL)
+    # 处理完整的 <think>...</think> 区块，并对其余文本及工具标签做安全转义渲染
+    pos = 0
+    for match in re.finditer(r'<think>(.*?)</think>', remaining, flags=re.DOTALL):
+        if match.start() > pos:
+            parts.append(_render_plain_and_tool_segments(remaining[pos:match.start()]))
+        parts.append(_render_think_done(match.group(1)))
+        pos = match.end()
 
-    return content
+    tail = remaining[pos:]
+    if '<think>' in tail:
+        before_think, in_progress_think = tail.split('<think>', 1)
+        if before_think:
+            parts.append(_render_plain_and_tool_segments(before_think))
+        parts.append(_render_think_in_progress(in_progress_think))
+    elif tail:
+        parts.append(_render_plain_and_tool_segments(tail))
+
+    return ''.join(parts)
 
 
 @st.cache_resource
 def load_model_tokenizer(model_path):
+    trust_remote_code = os.getenv("MINIMIND_TRUST_REMOTE_CODE") == "1"
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        trust_remote_code=True
+        trust_remote_code=trust_remote_code
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
-        trust_remote_code=True
+        trust_remote_code=trust_remote_code
     )
     model = model.half().eval().to(device)
     return model, tokenizer
@@ -309,9 +373,9 @@ st.markdown(
     f'<div style="display: flex; flex-direction: column; align-items: center; text-align: center; margin: 0; padding: 0;">'
     '<div style="font-style: italic; font-weight: 900; margin: 0; padding-top: 4px; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; width: 100%;">'
     f'<img src="{image_url}" style="width: 40px; height: 40px; "> '
-    f'<span style="font-size: 26px; margin-left: 10px;">{slogan}</span>'
+    f'<span style="font-size: 26px; margin-left: 10px;">{escape_html_text(slogan)}</span>'
     '</div>'
-    f'<span style="color: #bbb; font-style: italic; margin-top: 6px; margin-bottom: 10px;">{get_text("disclaimer")}</span>'
+    f'<span style="color: #bbb; font-style: italic; margin-top: 6px; margin-bottom: 10px;">{escape_html_text(get_text("disclaimer"))}</span>'
     '</div>',
     unsafe_allow_html=True
 )
@@ -411,9 +475,9 @@ def main():
                     tc = json.loads(tc_str.strip())
                     result = execute_tool(tc.get('name', ''), tc.get('arguments', {}))
                     st.session_state.chat_messages.append({"role": "tool", "content": json.dumps(result, ensure_ascii=False)})
-                    safe_tool_name = escape_html_text(tc.get("name", ""))
-                    safe_tool_result = escape_html_text(json.dumps(result, ensure_ascii=False))
-                    tool_results.append(f'<div style="background: rgba(90, 130, 110, 0.20); border: 1px solid rgba(150, 200, 170, 0.30); padding: 10px 12px; border-radius: 12px; margin: 6px 0;"><div style="font-size:12px;opacity:.75;display:block;margin:0 0 6px 0;line-height:1;">ToolCalled</div><div><b>{safe_tool_name}</b>: {safe_tool_result}</div></div>')
+                    tool_results.append(
+                        f'<tool_result>{json.dumps({"name": tc.get("name", ""), "result": result}, ensure_ascii=False)}</tool_result>'
+                    )
                 except Exception:
                     pass
             full_answer += "\n" + "\n".join(tool_results) + "\n"

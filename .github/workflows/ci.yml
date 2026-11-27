@@ -17,7 +17,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install test dependencies
-        run: python -m pip install --upgrade pip && pip install fastapi httpx pydantic pytest
-      - name: Run API security and swarm orchestrator tests
-        run: python3 -m pytest -q tests/test_api_security.py tests/test_swarm_orchestrator.py
+      - name: Install lightweight test dependencies
+        run: python -m pip install --upgrade pip && pip install fastapi httpx pydantic
+      - name: Syntax check Python sources with py_compile
+        run: python3 -m py_compile eval_llm.py model/*.py scripts/*.py trainer/*.py tests/*.py
+      - name: Run unit tests (model-free)
+        run: python3 -m unittest discover -s tests -v

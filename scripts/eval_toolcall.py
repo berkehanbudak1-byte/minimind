@@ -60,9 +60,10 @@ def init_model(args):
         model = MiniMindForCausalLM(MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)))
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
-        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+        model.load_state_dict(torch.load(ckp, map_location=args.device, weights_only=True), strict=True)
     else:
-        model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
+        trust_remote_code = bool(getattr(args, 'trust_remote_code', False)) or (os.getenv("MINIMIND_TRUST_REMOTE_CODE") == "1")
+        model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=trust_remote_code)
     get_model_params(model, model.config)
     return model.half().eval().to(args.device), tokenizer
 
@@ -217,6 +218,7 @@ def main():
     parser.add_argument('--api_key', default='sk-123', type=str, help="OpenAI兼容接口的api_key")
     parser.add_argument('--api_model', default='jingyaogong/minimind-3:latest', type=str, help="API请求时使用的模型名称")
     parser.add_argument('--stream', default=1, type=int, help="API模式下是否流式输出（0=否，1=是）")
+    parser.add_argument('--trust_remote_code', default=False, action='store_true', help="仅在信任 HuggingFace 模型仓库时启用远程代码执行")
     args = parser.parse_args()
 
     model = tokenizer = client = None

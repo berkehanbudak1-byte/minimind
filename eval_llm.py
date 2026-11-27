@@ -21,12 +21,13 @@ def init_model(args):
         ))
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
-        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+        model.load_state_dict(torch.load(ckp, map_location=args.device, weights_only=True), strict=True)
         if args.lora_weight != 'None':
             apply_lora(model, rank=args.lora_rank)
             load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
     else:
-        model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
+        trust_remote_code = bool(getattr(args, 'trust_remote_code', False)) or (os.getenv("MINIMIND_TRUST_REMOTE_CODE") == "1")
+        model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=trust_remote_code)
     get_model_params(model, model.config)
     return model.half().eval().to(args.device), tokenizer
 
@@ -48,6 +49,7 @@ def main():
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    parser.add_argument('--trust_remote_code', default=False, action='store_true', help="仅在信任 HuggingFace 模型仓库时启用远程代码执行")
     args = parser.parse_args()
     
     prompts = [
