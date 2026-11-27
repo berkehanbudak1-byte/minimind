@@ -15,11 +15,14 @@ Built on Python stdlib ``concurrent.futures.ThreadPoolExecutor`` and integrated 
 
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import os
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import urllib.error
@@ -89,9 +92,13 @@ DEFAULT_SWARM_WORKERS = 4
 MAX_SWARM_SLICES = 16
 DEFAULT_SLICE_TIMEOUT_SECONDS = 15.0
 MAX_SLICE_TIMEOUT_SECONDS = 60.0
+MAX_SWARM_HISTORY = 20
 XAI_DEFAULT_BASE_URL = "https://api.x.ai/v1"
 XAI_DEFAULT_MODEL = "grok-3-mini"
 _MAX_REMOTE_RESPONSE_BYTES = 1024 * 1024
+
+_SWARM_HISTORY_LOCK = threading.Lock()
+_SWARM_HISTORY: deque[Dict[str, Any]] = deque(maxlen=MAX_SWARM_HISTORY)
 
 _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}$")
 _SAFE_MODEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$")
@@ -385,6 +392,58 @@ def _call_xai_chat_completions(
     return content.strip()
 
 
+def _record_swarm_run(
+    *,
+    order_id: str,
+    provider: str,
+    model_name: str,
+    max_workers: int,
+    results: Sequence[Mapping[str, Any]],
+    injection_summary: Mapping[str, Any],
+    one_door_out: Mapping[str, Any],
+    duration_ms: float,
+) -> Dict[str, Any]:
+    """Record a bounded, sanitized MiniMind swarm run summary (no raw prompts, outputs, or secrets)."""
+    total_slices = len(results)
+    succeeded = sum(1 for r in results if r.get("status") == "ok")
+    summary = {
+        "order_id": order_id,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "provider": str(provider),
+        "model_name": str(model_name),
+        "max_workers": int(max_workers),
+        "slice_count": total_slices,
+        "succeeded_slices": succeeded,
+        "failed_slices": total_slices - succeeded,
+        "injection_detected": bool(injection_summary.get("detected", False)),
+        "injection_flagged_count": int(injection_summary.get("flagged_count", 0)),
+        "one_door_out_status": str(one_door_out.get("status", "UNKNOWN")),
+        "approval_required": bool(one_door_out.get("approval_required", False)),
+        "reason_count": len(one_door_out.get("reasons") or ()),
+        "duration_ms": round(max(0.0, float(duration_ms)), 2),
+    }
+    with _SWARM_HISTORY_LOCK:
+        _SWARM_HISTORY.append(summary)
+    return dict(summary)
+
+
+def get_swarm_history(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Return up to MAX_SWARM_HISTORY sanitized recent swarm run summaries (newest first)."""
+    with _SWARM_HISTORY_LOCK:
+        items = list(reversed(_SWARM_HISTORY))
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise SwarmPolicyError("history limit must be a non-negative integer")
+        items = items[: min(limit, MAX_SWARM_HISTORY)]
+    return [dict(entry) for entry in items]
+
+
+def clear_swarm_history() -> None:
+    """Clear the bounded in-memory MiniMind swarm run history."""
+    with _SWARM_HISTORY_LOCK:
+        _SWARM_HISTORY.clear()
+
+
 def get_swarm_policy() -> Dict[str, Any]:
     """Return static, non-sensitive MiniMind swarm capabilities and security policy."""
     return {
@@ -394,6 +453,7 @@ def get_swarm_policy() -> Dict[str, Any]:
         "default_workers": DEFAULT_SWARM_WORKERS,
         "max_slices": MAX_SWARM_SLICES,
         "max_slice_timeout_seconds": MAX_SLICE_TIMEOUT_SECONDS,
+        "history_limit": MAX_SWARM_HISTORY,
         "supported_providers": ["local", "xai", "grok"],
         "read_only_worker_tools": sorted(READ_ONLY_WORKER_TOOLS),
         "forbidden_write_tools": sorted(FORBIDDEN_WRITE_TOOLS),
@@ -419,6 +479,7 @@ def run_swarm_orchestration(
     opener: Any = None,
 ) -> Dict[str, Any]:
     """Execute a validated MiniMind SwarmWorkOrder concurrently with strict security controls."""
+    run_started = time.monotonic()
     if not isinstance(work_order, SwarmWorkOrder):
         raise SwarmPolicyError("work_order must be a SwarmWorkOrder instance")
 
@@ -633,9 +694,26 @@ def run_swarm_orchestration(
         executor.shutdown(wait=False, cancel_futures=True)
 
     flagged_slices = [r["slice_id"] for r in results if r.get("injection_detected")]
+    injection_summary = {
+        "detected": bool(flagged_slices),
+        "flagged_slices": flagged_slices,
+        "flagged_count": sum(int(r.get("injection_flagged_count", 0)) for r in results),
+    }
     one_door_out = evaluate_one_door_out(
         results,
         requested_actions=work_order.requested_actions,
+    )
+
+    total_duration_ms = round((time.monotonic() - run_started) * 1000.0, 2)
+    _record_swarm_run(
+        order_id=order_id,
+        provider=provider_cfg["provider"],
+        model_name=provider_cfg["model_name"],
+        max_workers=effective_workers,
+        results=results,
+        injection_summary=injection_summary,
+        one_door_out=one_door_out,
+        duration_ms=total_duration_ms,
     )
 
     return {
@@ -644,6 +722,7 @@ def run_swarm_orchestration(
         "model_name": provider_cfg["model_name"],
         "max_workers": effective_workers,
         "slice_timeout_seconds": default_timeout,
+        "duration_ms": total_duration_ms,
         "generation_params": {
             "temperature": temperature,
             "top_p": top_p,
@@ -651,11 +730,7 @@ def run_swarm_orchestration(
         },
         "disjoint_ownership": ownership_map,
         "slices": results,
-        "injection_summary": {
-            "detected": bool(flagged_slices),
-            "flagged_slices": flagged_slices,
-            "flagged_count": sum(int(r.get("injection_flagged_count", 0)) for r in results),
-        },
+        "injection_summary": injection_summary,
         "one_door_out": one_door_out,
         "security_invariants": get_swarm_policy()["invariants"],
     }

@@ -9,12 +9,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from scripts.swarm_orchestrator import (
     FORBIDDEN_WRITE_TOOLS,
+    MAX_SWARM_HISTORY,
     MAX_SWARM_SLICES,
     MAX_SWARM_WORKERS,
     SwarmPolicyError,
     SwarmSlice,
     SwarmWorkOrder,
+    clear_swarm_history,
     enforce_worker_read_only_tools,
+    get_swarm_history,
     get_swarm_policy,
     isolate_untrusted_payload,
     run_swarm_orchestration,
@@ -279,7 +282,54 @@ class TestMiniMindSwarmOrchestrator(unittest.TestCase):
 
         policy = get_swarm_policy()
         self.assertTrue(policy["zero_extra_dependencies"])
+        self.assertEqual(policy["history_limit"], MAX_SWARM_HISTORY)
         self.assertEqual(policy["engine"], "stdlib.concurrent.futures.ThreadPoolExecutor")
+
+    def test_swarm_history_bounded_and_sanitized(self):
+        clear_swarm_history()
+        self.assertEqual(get_swarm_history(), [])
+
+        for idx in range(MAX_SWARM_HISTORY + 5):
+            order = SwarmWorkOrder(
+                order_id=f"mm-hist-{idx}",
+                provider="local",
+                max_workers=1,
+                slices=[
+                    SwarmSlice(
+                        slice_id="s1",
+                        owned_keys=(f"shard-{idx}",),
+                        messages=[{"role": "user", "content": f"SECRET-PROMPT-CONTENT-{idx}"}],
+                    )
+                ],
+            )
+            run_swarm_orchestration(order)
+
+        history = get_swarm_history()
+        self.assertEqual(len(history), MAX_SWARM_HISTORY)
+        self.assertEqual(history[0]["order_id"], f"mm-hist-{MAX_SWARM_HISTORY + 4}")
+        self.assertEqual(history[-1]["order_id"], "mm-hist-5")
+
+        top_3 = get_swarm_history(limit=3)
+        self.assertEqual(
+            [entry["order_id"] for entry in top_3],
+            [
+                f"mm-hist-{MAX_SWARM_HISTORY + 4}",
+                f"mm-hist-{MAX_SWARM_HISTORY + 3}",
+                f"mm-hist-{MAX_SWARM_HISTORY + 2}",
+            ],
+        )
+
+        serialized = json.dumps(history)
+        self.assertNotIn("SECRET-PROMPT-CONTENT", serialized)
+        for entry in history:
+            self.assertEqual(entry["provider"], "local")
+            self.assertEqual(entry["slice_count"], 1)
+            self.assertEqual(entry["succeeded_slices"], 1)
+            self.assertEqual(entry["one_door_out_status"], "READ_ONLY_COMPLETE")
+            self.assertIn("timestamp_utc", entry)
+
+        with self.assertRaises(SwarmPolicyError):
+            get_swarm_history(limit=-1)
 
 
 if __name__ == "__main__":

@@ -97,11 +97,12 @@ class TorchRolloutEngine(RolloutEngine):
 
 # ===== SGLang HTTP API 推理引擎 =====
 class SGLangRolloutEngine(RolloutEngine):
-    def __init__(self, base_url: str, model_path: str, shared_ckpt_path: str = "./sglang_ckpt", timeout: int = 120):
+    def __init__(self, base_url: str, model_path: str, shared_ckpt_path: str = "./sglang_ckpt", timeout: int = 120, trust_remote_code: Optional[bool] = None):
         self.base_url = base_url.rstrip('/')
         self.shared_ckpt_path = shared_ckpt_path
         self.timeout = timeout
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        allow_remote = (os.getenv("MINIMIND_TRUST_REMOTE_CODE") == "1") if trust_remote_code is None else bool(trust_remote_code)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=allow_remote)
         self.http = requests
     
     def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:

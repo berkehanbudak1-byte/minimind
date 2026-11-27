@@ -62,6 +62,16 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+def load_resume_checkpoint(path, map_location='cpu'):
+    """Load a training resume checkpoint safely with weights_only=True by default.
+
+    Legacy checkpoints containing non-tensor objects require explicitly opting in via
+    MINIMIND_ALLOW_UNSAFE_CHECKPOINT=1 for trusted local checkpoints.
+    """
+    allow_unsafe = os.getenv("MINIMIND_ALLOW_UNSAFE_CHECKPOINT") == "1"
+    return torch.load(path, map_location=map_location, weights_only=not allow_unsafe)
+
+
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
@@ -107,7 +117,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         torch.cuda.empty_cache()
     else:  # 加载模式
         if os.path.exists(resume_path):
-            ckp_data = torch.load(resume_path, map_location='cpu')
+            ckp_data = load_resume_checkpoint(resume_path, map_location='cpu')
             saved_ws = ckp_data.get('world_size', 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
             if saved_ws != current_ws:
@@ -124,7 +134,7 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
         weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-        weights = torch.load(weight_path, map_location=device)
+        weights = torch.load(weight_path, map_location=device, weights_only=True)
         model.load_state_dict(weights, strict=False)
 
     get_model_params(model, lm_config)
@@ -159,9 +169,10 @@ class SkipBatchSampler(Sampler):
 
 
 class LMForRewardModel:
-    def __init__(self, model_path, device="cuda", dtype=torch.float16):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)
+    def __init__(self, model_path, device="cuda", dtype=torch.float16, trust_remote_code=None):
+        allow_remote = (os.getenv("MINIMIND_TRUST_REMOTE_CODE") == "1") if trust_remote_code is None else bool(trust_remote_code)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=allow_remote)
+        self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=allow_remote)
         self.model = self.model.to(device).eval()
         self.device = device
 

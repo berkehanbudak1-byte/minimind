@@ -35,6 +35,7 @@ from scripts.api_security import (
     safe_error_message,
     validate_and_sanitize_messages,
     validate_generation_params,
+    validate_server_bind_security,
     validate_tools,
     verify_bearer_token,
 )
@@ -94,6 +95,7 @@ model = None
 tokenizer = None
 API_KEY: Optional[str] = os.environ.get("MINIMIND_API_KEY", "").strip() or None
 auth_rate_limiter = SlidingWindowAuthRateLimiter(max_failures=5, window_seconds=60.0, max_tracked_ips=4096)
+REQUIRE_AUTH: bool = False
 
 
 def _raw_configured_api_key() -> Optional[str]:
@@ -122,6 +124,21 @@ def _extract_client_ip(http_request: Optional[Request]) -> str:
     return str(host).strip() if host else "unknown"
 
 
+def configure_server_auth(
+    host: str,
+    api_key: Optional[str] = None,
+    *,
+    allow_unauthenticated: bool = False,
+) -> bool:
+    """Validate server bind host/auth settings and return whether auth is required."""
+    effective_key = (api_key or "").strip() or get_configured_api_key()
+    return validate_server_bind_security(
+        host,
+        effective_key,
+        allow_unauthenticated=allow_unauthenticated,
+    )
+
+
 def init_model(args):
     if torch is None or AutoTokenizer is None:
         raise RuntimeError("torch and transformers are required to load MiniMind weights")
@@ -141,9 +158,10 @@ def init_model(args):
             apply_lora(mdl, rank=args.lora_rank)
             load_lora(mdl, f'../{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
     else:
+        trust_remote_code = bool(getattr(args, "trust_remote_code", False)) or (os.getenv("MINIMIND_TRUST_REMOTE_CODE") == "1")
         mdl = AutoModelForCausalLM.from_pretrained(
             args.load_from,
-            trust_remote_code=bool(getattr(args, "trust_remote_code", False)),
+            trust_remote_code=trust_remote_code,
         )
     print(f'MiniMind模型参数量: {sum(p.numel() for p in mdl.parameters()) / 1e6:.2f} M(illion)')
     return mdl.half().eval().to(device), tok
@@ -309,7 +327,7 @@ def chat_completions(
     authorization: Optional[str] = Header(default=None),
 ):
     raw_key = _raw_configured_api_key()
-    if raw_key:
+    if raw_key or REQUIRE_AUTH:
         client_ip = _extract_client_ip(http_request)
         allowed, retry_after = auth_rate_limiter.check_allowed(client_ip)
         if not allowed:
@@ -322,7 +340,7 @@ def chat_completions(
             expected_key = get_configured_api_key()
         except (DPAPIError, ValueError):
             raise HTTPException(status_code=503, detail="API key configuration error") from None
-        if not verify_bearer_token(authorization, expected_key):
+        if not verify_bearer_token(authorization, expected_key, require_auth=REQUIRE_AUTH):
             auth_rate_limiter.record_failure(client_ip)
             raise HTTPException(
                 status_code=401,
@@ -434,10 +452,16 @@ if __name__ == "__main__":
     parser.add_argument('--port', default=8998, type=int, help="服务监听端口")
     parser.add_argument('--api_key', default='', type=str, help="可选 Bearer API Key（也可通过 MINIMIND_API_KEY 环境变量设置）")
     parser.add_argument('--trust_remote_code', default=False, action='store_true', help="仅在信任 HuggingFace 模型仓库时启用远程代码执行")
+    parser.add_argument('--allow-unauthenticated', '--allow_unauthenticated', dest='allow_unauthenticated', default=False, action='store_true', help="显式允许在非回环地址上不配置 API Key 启动（不推荐）")
     args = parser.parse_args()
     device = args.device
     if args.api_key.strip():
         API_KEY = args.api_key.strip()
+    REQUIRE_AUTH = configure_server_auth(
+        args.host,
+        API_KEY,
+        allow_unauthenticated=args.allow_unauthenticated,
+    )
     model, tokenizer = init_model(args)
     if uvicorn is None:
         raise RuntimeError("uvicorn is required to start the server")
