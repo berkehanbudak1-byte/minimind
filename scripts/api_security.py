@@ -1,9 +1,17 @@
+import base64
+import binascii
+from collections import OrderedDict, deque
 import hmac
 import html
 import ipaddress
 import math
+import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import subprocess
+import sys
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
@@ -278,7 +286,7 @@ def validate_api_base_url(url: str, *, allow_local: bool = True) -> str:
 
 
 def redact_sensitive_text(text: str) -> str:
-    """Redact API keys, Bearer tokens, and URL credentials from logs/errors."""
+    """Redact API keys, Bearer tokens, DPAPI tokens, and URL credentials from logs/errors."""
     s = str(text or "")
     s = re.sub(r"(https?://)([^/\s:@]+:[^/\s@]+@)", r"\1***@", s, flags=re.IGNORECASE)
     s = re.sub(
@@ -288,6 +296,7 @@ def redact_sensitive_text(text: str) -> str:
         flags=re.IGNORECASE,
     )
     s = re.sub(r"\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}", r"\1[REDACTED]", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bdpapi:v1:[A-Za-z0-9+/=]+", "dpapi:v1:[REDACTED]", s)
     s = re.sub(r"\b(?:sk|xai|gsk|AIza)[-_A-Za-z0-9]{8,}\b", "[REDACTED_KEY]", s)
     return s
 
@@ -301,3 +310,293 @@ def safe_error_message(exc: Exception, default_message: str = "Internal generati
 def escape_html_text(text: str) -> str:
     """Escape arbitrary user/model text before embedding in Streamlit unsafe_allow_html blocks."""
     return html.escape(str(text or ""), quote=True)
+
+
+class SlidingWindowAuthRateLimiter:
+    """Bounded sliding-window per-IP rate limiter for failed API-key authentication."""
+
+    def __init__(
+        self,
+        max_failures: int = 5,
+        window_seconds: float = 60.0,
+        max_tracked_ips: int = 4096,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        if max_failures < 1:
+            raise ValueError("max_failures must be >= 1")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be > 0")
+        if max_tracked_ips < 1:
+            raise ValueError("max_tracked_ips must be >= 1")
+        self.max_failures = int(max_failures)
+        self.window_seconds = float(window_seconds)
+        self.max_tracked_ips = int(max_tracked_ips)
+        self.clock = clock
+        self._failures: OrderedDict[str, deque] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _normalize_ip(ip: Optional[str]) -> str:
+        cleaned = str(ip or "").strip()[:128]
+        return cleaned or "unknown"
+
+    def _prune_bucket(self, bucket: deque, now: float) -> None:
+        cutoff = now - self.window_seconds
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+
+    def _evict_if_needed(self, now: float) -> None:
+        if len(self._failures) < self.max_tracked_ips:
+            return
+        cutoff = now - self.window_seconds
+        expired = [k for k, q in self._failures.items() if not q or q[-1] <= cutoff]
+        for k in expired:
+            self._failures.pop(k, None)
+        while len(self._failures) >= self.max_tracked_ips:
+            self._failures.popitem(last=False)
+
+    def check_allowed(self, ip: Optional[str]) -> Tuple[bool, int]:
+        """Return `(allowed, retry_after_seconds)` for an authentication attempt."""
+        key = self._normalize_ip(ip)
+        now = float(self.clock())
+        with self._lock:
+            bucket = self._failures.get(key)
+            if bucket is None:
+                return True, 0
+            self._prune_bucket(bucket, now)
+            if not bucket:
+                self._failures.pop(key, None)
+                return True, 0
+            if len(bucket) >= self.max_failures:
+                retry_after = max(1, int(math.ceil(self.window_seconds - (now - bucket[0]))))
+                return False, retry_after
+            return True, 0
+
+    def is_blocked(self, ip: Optional[str]) -> bool:
+        allowed, _ = self.check_allowed(ip)
+        return not allowed
+
+    def retry_after(self, ip: Optional[str]) -> int:
+        allowed, retry = self.check_allowed(ip)
+        return 0 if allowed else retry
+
+    def record_failure(self, ip: Optional[str]) -> int:
+        """Record a failed authentication attempt for `ip` and return active failure count."""
+        key = self._normalize_ip(ip)
+        now = float(self.clock())
+        with self._lock:
+            bucket = self._failures.get(key)
+            if bucket is not None:
+                self._prune_bucket(bucket, now)
+                self._failures.move_to_end(key)
+            else:
+                self._evict_if_needed(now)
+                bucket = deque(maxlen=self.max_failures)
+                self._failures[key] = bucket
+            bucket.append(now)
+            return len(bucket)
+
+    def record_success(self, ip: Optional[str]) -> None:
+        """Clear tracked failure timestamps for `ip` upon successful authentication."""
+        key = self._normalize_ip(ip)
+        with self._lock:
+            self._failures.pop(key, None)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failures.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._failures)
+
+
+DPAPI_PREFIX = "dpapi:v1:"
+DPAPI_ALLOWED_SCOPES = frozenset({"CurrentUser", "LocalMachine"})
+
+_DPAPI_ENV_INPUT_B64 = "_DPAPI_INPUT_B64"
+_DPAPI_ENV_ENTROPY_B64 = "_DPAPI_ENTROPY_B64"
+_DPAPI_ENV_SCOPE = "_DPAPI_SCOPE"
+
+_PS_DPAPI_PROTECT_SCRIPT = (
+    "Add-Type -AssemblyName System.Security; "
+    "$ErrorActionPreference = 'Stop'; "
+    "$inBytes = [Convert]::FromBase64String($env:_DPAPI_INPUT_B64); "
+    "$entropyBytes = $null; "
+    "if ($env:_DPAPI_ENTROPY_B64) { $entropyBytes = [Convert]::FromBase64String($env:_DPAPI_ENTROPY_B64) }; "
+    "$scope = if ($env:_DPAPI_SCOPE -eq 'LocalMachine') { "
+    "[System.Security.Cryptography.DataProtectionScope]::LocalMachine } else { "
+    "[System.Security.Cryptography.DataProtectionScope]::CurrentUser }; "
+    "$outBytes = [System.Security.Cryptography.ProtectedData]::Protect($inBytes, $entropyBytes, $scope); "
+    "[Console]::Out.Write([Convert]::ToBase64String($outBytes))"
+)
+
+_PS_DPAPI_UNPROTECT_SCRIPT = (
+    "Add-Type -AssemblyName System.Security; "
+    "$ErrorActionPreference = 'Stop'; "
+    "$inBytes = [Convert]::FromBase64String($env:_DPAPI_INPUT_B64); "
+    "$entropyBytes = $null; "
+    "if ($env:_DPAPI_ENTROPY_B64) { $entropyBytes = [Convert]::FromBase64String($env:_DPAPI_ENTROPY_B64) }; "
+    "$scope = if ($env:_DPAPI_SCOPE -eq 'LocalMachine') { "
+    "[System.Security.Cryptography.DataProtectionScope]::LocalMachine } else { "
+    "[System.Security.Cryptography.DataProtectionScope]::CurrentUser }; "
+    "$outBytes = [System.Security.Cryptography.ProtectedData]::Unprotect($inBytes, $entropyBytes, $scope); "
+    "[Console]::Out.Write([Convert]::ToBase64String($outBytes))"
+)
+
+
+class DPAPIError(RuntimeError):
+    """Raised when Windows DPAPI protect/unprotect fails or is unavailable."""
+
+
+def is_dpapi_secret(value: Optional[str]) -> bool:
+    """Return True when value carries the `dpapi:v1:` sealed secret prefix."""
+    return isinstance(value, str) and value.strip().startswith(DPAPI_PREFIX)
+
+
+def _validate_dpapi_scope(scope: str) -> str:
+    if not isinstance(scope, str) or scope not in DPAPI_ALLOWED_SCOPES:
+        raise ValueError(f"Unsupported DPAPI scope; expected one of {sorted(DPAPI_ALLOWED_SCOPES)}")
+    return scope
+
+
+def _run_dpapi_script(
+    script: str,
+    input_b64: str,
+    *,
+    scope: str,
+    entropy: Optional[str],
+    timeout: float,
+    runner: Optional[Callable[..., Any]],
+) -> str:
+    if runner is None and sys.platform != "win32":
+        raise DPAPIError("Windows DPAPI is only available on Windows (win32).")
+    if entropy is not None and not isinstance(entropy, str):
+        raise ValueError("entropy must be a string or None")
+
+    child_env = dict(os.environ)
+    child_env[_DPAPI_ENV_INPUT_B64] = input_b64
+    child_env[_DPAPI_ENV_SCOPE] = scope
+    if entropy:
+        child_env[_DPAPI_ENV_ENTROPY_B64] = base64.b64encode(entropy.encode("utf-8")).decode("ascii")
+    else:
+        child_env.pop(_DPAPI_ENV_ENTROPY_B64, None)
+
+    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]
+    exec_fn = runner if runner is not None else subprocess.run
+    try:
+        proc = exec_fn(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=child_env,
+            timeout=timeout,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DPAPIError(f"DPAPI runner failed ({type(exc).__name__}).") from None
+
+    returncode = getattr(proc, "returncode", None)
+    if returncode != 0:
+        raise DPAPIError(f"DPAPI operation failed with exit code {returncode}.")
+
+    stdout = str(getattr(proc, "stdout", "") or "").strip()
+    if not stdout:
+        raise DPAPIError("DPAPI operation returned empty output.")
+    return stdout
+
+
+def seal_dpapi_secret(
+    plaintext: str,
+    *,
+    scope: str = "CurrentUser",
+    entropy: Optional[str] = None,
+    timeout: float = 15.0,
+    runner: Optional[Callable[..., Any]] = None,
+) -> str:
+    """Seal a UTF-8 secret via Windows DPAPI using env-var Base64 passing (no cmd interpolation)."""
+    if not isinstance(plaintext, str) or not plaintext:
+        raise ValueError("plaintext secret must be a non-empty string")
+    valid_scope = _validate_dpapi_scope(scope)
+    input_b64 = base64.b64encode(plaintext.encode("utf-8")).decode("ascii")
+    out_b64 = _run_dpapi_script(
+        _PS_DPAPI_PROTECT_SCRIPT,
+        input_b64,
+        scope=valid_scope,
+        entropy=entropy,
+        timeout=timeout,
+        runner=runner,
+    )
+    try:
+        raw_protected = base64.b64decode(out_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise DPAPIError("DPAPI protect returned invalid Base64 output.") from None
+    if not raw_protected:
+        raise DPAPIError("DPAPI protect returned empty ciphertext.")
+    return f"{DPAPI_PREFIX}{base64.b64encode(raw_protected).decode('ascii')}"
+
+
+def unseal_dpapi_secret(
+    sealed_value: str,
+    *,
+    scope: str = "CurrentUser",
+    entropy: Optional[str] = None,
+    timeout: float = 15.0,
+    runner: Optional[Callable[..., Any]] = None,
+) -> str:
+    """Unseal a `dpapi:v1:<b64>` token back to its original UTF-8 secret."""
+    if not isinstance(sealed_value, str):
+        raise ValueError("sealed_value must be a string")
+    token = sealed_value.strip()
+    if not token.startswith(DPAPI_PREFIX):
+        raise ValueError(f"sealed_value must start with '{DPAPI_PREFIX}'")
+    payload_b64 = token[len(DPAPI_PREFIX):].strip()
+    if not payload_b64:
+        raise ValueError("sealed_value payload must not be empty")
+    try:
+        raw_cipher = base64.b64decode(payload_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("sealed_value contains invalid Base64 payload") from None
+    if not raw_cipher:
+        raise ValueError("sealed_value payload must not be empty")
+
+    valid_scope = _validate_dpapi_scope(scope)
+    canonical_in = base64.b64encode(raw_cipher).decode("ascii")
+    out_b64 = _run_dpapi_script(
+        _PS_DPAPI_UNPROTECT_SCRIPT,
+        canonical_in,
+        scope=valid_scope,
+        entropy=entropy,
+        timeout=timeout,
+        runner=runner,
+    )
+    try:
+        raw_plain = base64.b64decode(out_b64, validate=True)
+        return raw_plain.decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        raise DPAPIError("DPAPI unprotect returned invalid UTF-8 payload.") from None
+
+
+def resolve_dpapi_secret(
+    value: Optional[str],
+    *,
+    scope: str = "CurrentUser",
+    entropy: Optional[str] = None,
+    timeout: float = 15.0,
+    runner: Optional[Callable[..., Any]] = None,
+) -> Optional[str]:
+    """Return plaintext secret unchanged, or unseal when prefixed with `dpapi:v1:`."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if raw.startswith(DPAPI_PREFIX):
+        return unseal_dpapi_secret(
+            raw,
+            scope=scope,
+            entropy=entropy,
+            timeout=timeout,
+            runner=runner,
+        )
+    return raw
+
